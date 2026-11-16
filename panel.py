@@ -24,7 +24,110 @@ LOG_LOCK = threading.Lock()
 JOB = {"running": False, "target": 0, "done": 0, "current": "", "stage": "",
        "started_at": None, "finished_at": None, "error": "", "invite": core.INVITE}
 STOP = threading.Event()
+PROXY = os.environ.get("RESI_PROXY", "")   # 面板侧访问 breezeblue 用的出口
 INV_CACHE = {"at": 0, "rows": []}
+CREDITS = {}            # email -> {balance, ok, at}
+CRED_LOCK = threading.Lock()
+CRED_THREAD = {"running": False}
+
+
+def credit_refresh(email, row=None):
+    """用「邮箱+密码」重新取一次会话（服务端对老号直接 200 authenticated），再读账号态与积分。"""
+    row = row or next((r for r in read_accounts() if r.get("email") == email), None)
+    if not row:
+        return None
+    try:
+        from curl_cffi import requests as cr
+        proxy = PROXY or None
+        s = cr.Session(impersonate=core.IMPERSONATE, timeout=30,
+                       proxies=core._px(proxy) if proxy else None)
+        s.headers.update({"accept": "application/json, text/plain, */*",
+                          "origin": core.BASE, "referer": core.AUTH_PAGE})
+        payload = {"email": email, "password": row.get("password") or ""}
+        r = None
+        for attempt in range(3):
+            try:
+                r = s.post(core.BASE + "/api/auth/email/continue", json=payload)
+                break
+            except Exception:
+                time.sleep(1.5 + attempt)
+                s = account_session(row)
+        if r is None:
+            raise RuntimeError("login transport failed")
+        info = {"at": time.time(), "code": r.status_code}
+        body = {}
+        try:
+            body = r.json()
+        except Exception:
+            pass
+        info["state"] = body.get("status")
+        if r.status_code == 200 and body.get("status") == "authenticated":
+            me = s.get(core.BASE + "/api/me")
+            crr = s.get(core.BASE + "/api/credits/summary")
+            info.update({"ok": me.status_code == 200, "me": me.status_code})
+            if me.status_code == 200:
+                try:
+                    b = me.json()
+                    info.update({"public_id": b.get("public_id"), "own_code": b.get("referral_code"),
+                                 "referral": b.get("invited_by_referral_code"),
+                                 "email_verified": b.get("email_verified")})
+                except Exception:
+                    pass
+                row["cookies"] = {c.name: c.value for c in s.cookies.jar}
+                try:
+                    rows = read_accounts()
+                    with io.open(core.ACCS, "w", encoding="utf-8") as f:
+                        for r_ in rows:
+                            f.write(json.dumps(r_, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+            if crr.status_code == 200:
+                try:
+                    c = crr.json()
+                    info.update({"balance": c.get("balance"), "daily_available": c.get("daily_claim_available"),
+                                 "granted": c.get("granted_total"), "consumed": c.get("consumed_total")})
+                except Exception:
+                    pass
+        else:
+            info["ok"] = False
+        with CRED_LOCK:
+            CREDITS[email] = info
+        return info
+    except Exception as exc:
+        with CRED_LOCK:
+            CREDITS[email] = {"at": time.time(), "ok": False, "error": str(exc)[:80]}
+        return None
+
+
+def credit_refresh_all(max_age=300, background=True):
+    rows = read_accounts()
+    todo = []
+    with CRED_LOCK:
+        for r in rows:
+            e = r.get("email")
+            c = CREDITS.get(e)
+            if not c or time.time() - c.get("at", 0) > max_age:
+                todo.append(r)
+    if not todo:
+        return 0
+    if not background:
+        for r in todo:
+            credit_refresh(r["email"], r)
+        return len(todo)
+    if CRED_THREAD["running"]:
+        return 0
+
+    def run():
+        CRED_THREAD["running"] = True
+        try:
+            for r in todo:
+                credit_refresh(r["email"], r)
+                time.sleep(0.4)
+        finally:
+            CRED_THREAD["running"] = False
+
+    threading.Thread(target=run, daemon=True).start()
+    return len(todo)
 
 
 def log(msg):
@@ -81,15 +184,24 @@ def job_thread(params):
 
 
 def account_session(row):
+    """用台账里的 cookie 复原会话；出口优先用 RESI_PROXY（本机直连 breezeblue 常被掐）。"""
     from curl_cffi import requests as cr
-    s = cr.Session(impersonate=core.IMPERSONATE, timeout=30)
-    for c in row.get("cookies") or []:
-        s.cookies.set(c, row["cookies"][c], domain="breezeblue.ai")
+    proxy = PROXY or None
+    s = cr.Session(impersonate=core.IMPERSONATE, timeout=30, proxies=core._px(proxy) if proxy else None)
+    for name, val in (row.get("cookies") or {}).items():
+        try:
+            if name.startswith("__Host-") or name.startswith("__Secure-"):
+                s.cookies.set(name, val, path="/")
+            else:
+                s.cookies.set(name, val, domain="breezeblue.ai")
+        except Exception:
+            pass
     s.headers.update({"accept": "application/json", "user-agent": "Mozilla/5.0"})
     return s
 
 
 def account_check(email):
+    info = credit_refresh(email) or {}
     row = next((r for r in read_accounts() if r.get("email") == email), None)
     if not row:
         return {"ok": False, "error": "account not found"}
@@ -121,6 +233,61 @@ def account_claim(email):
     s = account_session(row)
     r = s.post(core.BASE + "/api/credits/daily-claim", json={})
     return {"ok": r.status_code == 200, "status": r.status_code, "body": r.text[:300]}
+
+
+def account_relogin(email):
+    """会话过期时用邮箱密码重新走一遍登录（魔法链接），把新 cookie 写回台账。"""
+    rows = read_accounts()
+    row = next((r for r in rows if r.get("email") == email), None)
+    if not row:
+        return {"ok": False, "error": "account not found"}
+    from curl_cffi import requests as cr
+    s = cr.Session(impersonate=core.IMPERSONATE, proxies=core._px(PROXY) if PROXY else None, timeout=45)
+    s.headers.update({"accept": "application/json, text/plain, */*",
+                      "origin": core.BASE, "referer": core.AUTH_PAGE})
+    r = s.post(core.BASE + "/api/auth/email/continue",
+               json={"email": email, "password": row.get("password") or ""})
+    if r.status_code not in (200, 403):
+        return {"ok": False, "stage": "continue_failed", "status": r.status_code, "body": r.text[:160]}
+    body = {}
+    try:
+        body = r.json()
+    except Exception:
+        pass
+    # 老号 + 正确密码：continue 直接 200 authenticated 并下发会话，无需邮件
+    if r.status_code == 200 and (body.get("status") == "authenticated"
+                                 or any(c.name == "breeze_blue_session" for c in s.cookies.jar)):
+        me = s.get(core.BASE + "/api/me")
+        if me.status_code == 200:
+            row["cookies"] = {c.name: c.value for c in s.cookies.jar}
+            with io.open(core.ACCS, "w", encoding="utf-8") as f:
+                for r_ in rows:
+                    f.write(json.dumps(r_, ensure_ascii=False) + "\n")
+            info = credit_refresh(email, row) or {}
+            return {"ok": True, "public_id": info.get("public_id"), "balance": info.get("balance"),
+                    "mode": "password"}
+    links = core.wait_dispatch_links(email, timeout=120)
+    if not links:
+        return {"ok": False, "stage": "no_mail"}
+    v = None
+    for link in links[:4]:
+        flow, oob = core.parse_dispatch(link)
+        if not (flow and oob):
+            continue
+        v = s.post(core.BASE + "/api/auth/email/verify", json={"flow_token": flow, "oob_code": oob})
+        if v.status_code == 200:
+            break
+    if v is None or v.status_code != 200:
+        return {"ok": False, "stage": "verify_failed"}
+    me = s.get(core.BASE + "/api/me")
+    if me.status_code != 200:
+        return {"ok": False, "stage": "me_failed"}
+    row["cookies"] = {c.name: c.value for c in s.cookies.jar}
+    with io.open(core.ACCS, "w", encoding="utf-8") as f:
+        for r_ in rows:
+            f.write(json.dumps(r_, ensure_ascii=False) + "\n")
+    info = credit_refresh(email, row)
+    return {"ok": True, "public_id": (info or {}).get("public_id"), "balance": (info or {}).get("balance")}
 
 
 def inventory(limit=240, check=0):
@@ -171,10 +338,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if u.path == "/api/state":
             accs = read_accounts()
+            credit_refresh_all(background=True)
+            total, claimable = 0.0, 0
+            with CRED_LOCK:
+                for a in accs:
+                    c = CREDITS.get(a.get("email")) or {}
+                    a["credits"] = c.get("balance")
+                    a["credits_ok"] = c.get("ok")
+                    a["daily_available"] = c.get("daily_available")
+                    a["checked_at"] = c.get("at")
+                    if isinstance(c.get("balance"), (int, float)):
+                        total += c["balance"]
+                    if c.get("daily_available"):
+                        claimable += 1
             return write_json(self, {"job": JOB, "accounts": accs,
                                      "stats": {"accounts": len(accs),
                                                "dead_boxes": len(core.lines(core.DEAD)),
-                                               "used": len(core.lines(core.USED))}})
+                                               "used": len(core.lines(core.USED)),
+                                               "credits_total": round(total, 1),
+                                               "claimable": claimable,
+                                               "credits_pending": sum(1 for a in accs if a.get("credits") is None)}})
         if u.path == "/api/logs":
             q = parse_qs(u.query)
             after = int((q.get("after") or ["0"])[0])
@@ -221,10 +404,21 @@ class Handler(BaseHTTPRequestHandler):
             STOP.set()
             log("[job] stop requested")
             return write_json(self, {"ok": True})
+        if u.path == "/api/debug/credits":
+            with CRED_LOCK:
+                return write_json(self, CREDITS)
+        if u.path == "/api/accounts/refresh":
+            n = credit_refresh_all(max_age=0, background=False)
+            return write_json(self, {"ok": True, "refreshed": n})
         if u.path == "/api/account/check":
-            return write_json(self, account_check(body.get("email")))
+            info = credit_refresh(body.get("email")) or {}
+            out = account_check(body.get("email"))
+            out.update({k: info.get(k) for k in ("balance", "daily_available")})
+            return write_json(self, out)
         if u.path == "/api/account/claim":
             return write_json(self, account_claim(body.get("email")))
+        if u.path == "/api/account/relogin":
+            return write_json(self, account_relogin(body.get("email")))
         return write_json(self, {"error": "not found"}, 404)
 
 
