@@ -1,0 +1,6 @@
+data/
+*.jsonl
+.env
+__pycache__/
+*.pyc
+profiles/
