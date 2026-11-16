@@ -130,7 +130,11 @@ def register(email, password, invite=INVITE):
         site_key, cdata = meta.get("site_key"), meta.get("challenge_context")
         if not site_key:
             return {"ok": False, "stage": "no_challenge", "body": r.text[:200]}
-        token = asyncio.run(mint_token(site_key, cdata))
+        try:
+            token = asyncio.run(mint_token(site_key, cdata))
+        except Exception as exc:
+            return {"ok": False, "stage": "captcha_failed", "error": str(exc)[:160],
+                    "hint": "换一个出口 IP 重试（Turnstile 对同 IP 有节流）"}
         r2 = s.post(BASE + "/api/auth/signup-verification", json={"email": email, "token": token})
         receipt = (r2.json() or {}).get("receipt")
         if not receipt:
