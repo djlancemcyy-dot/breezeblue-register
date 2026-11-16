@@ -16,6 +16,46 @@ python proto_register.py --email xxx@outlook.com     # 协议版（推荐）
 python browser_register.py --email xxx@outlook.com   # UI 版（兜底，真 Chrome 指纹）
 ```
 
+## 一条命令跑 N 个号
+
+```bash
+export MAILNEST_KEY=sk_xxx
+export INVITE_CODE=XXXXXX
+
+python proto_register.py --count 5 \
+    --proxies http://127.0.0.1:7891,http://127.0.0.1:7892
+# 或：--proxy-file exits.txt（每行一个 http://host:port）
+```
+
+脚本自己会把三件事做完：
+
+| 环节 | 行为 |
+|---|---|
+| **验活** | 从 MailNest 库存（`GET /api/v1/email/exclusive`，`having`/`holding` 都算）随机取箱，先 `receive` 探一次：返回 `00000` 才用；`D0004`/`D0006` 写进 `data/dead_boxes.txt` 并跳过 |
+| **换箱** | 拿不到魔法链接（`no_mail`）或验证链接失效（`verify_failed`）→ 该箱标记 blocked，自动换下一个箱，最多 `--max-box-tries`（默认 8）个 |
+| **换出口** | Turnstile 铸 token 失败（`captcha_failed`）或链路传输异常 → 换下一个出口重试，每次最多 `--max-exit-tries`（默认 3）条；`429 RATE_LIMITED` 会按服务端 `retry_after_seconds` 等待后重跑 |
+
+出口在开跑前会先用 `api.ipify.org` 探活，不通的直接剔除。
+
+其它参数：
+
+```bash
+--count N          # 目标成功账号数（默认 1）
+--email xxx@x.com  # 只跑指定邮箱，跳过库存
+--password xxx     # 固定密码（默认随机 BzXXXXXX.kQeXXX）
+--max-box-tries 8  # 每个号最多换几个箱
+--max-exit-tries 3 # 每次最多换几个出口
+```
+
+产物：
+
+| 文件 | 内容 |
+|---|---|
+| `data/accounts.jsonl` | 成功账号：邮箱 / 密码 / public_id / 本号邀请码 / 所属邀请码 / cookie |
+| `data/used_emails.txt` | 已用邮箱（下次自动跳过）|
+| `data/dead_boxes.txt` | 死箱黑名单 |
+| `data/failed.jsonl` | 每次失败的结构化原因（stage / mode / exit）|
+
 ## 一、协议链路
 
 ```
