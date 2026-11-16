@@ -56,6 +56,39 @@ python proto_register.py --count 5 \
 | `data/dead_boxes.txt` | 死箱黑名单 |
 | `data/failed.jsonl` | 每次失败的结构化原因（stage / mode / exit）|
 
+## Web 面板
+
+```bash
+export MAILNEST_KEY=sk_xxx
+export INVITE_CODE=XXXXXX
+python panel.py --port 8799          # 打开 http://127.0.0.1:8799
+```
+
+零依赖（Python 标准库 http.server），打开就有：
+
+| 区块 | 能力 |
+|---|---|
+| 顶部 | 运行状态、目标/已完成进度条、当前处理的邮箱、账号数/死箱数 |
+| 开始/停止 | 输入数量、邀请码、固定密码、换箱/换出口上限、出口列表，一键开跑 / 一键停 |
+| **账号** | 表格列出邮箱 / 密码 / public_id / 本号邀请码 / 绑定邀请码 / 时间；支持搜索、**验活**（用存的 cookie 实时打 `/api/me` + `/api/credits/summary`）、**领额度**（`/api/credits/daily-claim`）、复制「邮箱----密码」、导出 CSV/JSON |
+| **日志** | 实时增量日志（2s 轮询、自动滚底、可清屏），带时间戳与 seq |
+| **库存** | 拉 MailNest 已购独占箱列表，标出已用/死箱，可按需探活前 N 个 |
+
+面板与 CLI 共用同一套逻辑（`proto_register.run_batch`），跑出来的号同样落在 `data/accounts.jsonl`。
+
+接口（方便接自己的系统）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/state` | 任务状态 + 账号列表 + 统计 |
+| GET | `/api/logs?after=SEQ` | 增量日志 |
+| POST | `/api/start` | `{count, proxies, invite, password, max_box_tries, max_exit_tries}` |
+| POST | `/api/stop` | 请求停止 |
+| POST | `/api/account/check` | `{email}` 验活 + 查额度 |
+| POST | `/api/account/claim` | `{email}` 领每日额度 |
+| GET | `/api/inventory?limit=200&check=20` | 库存（可选探活前 20 个）|
+| GET | `/api/export?fmt=csv` | 导出账号 |
+
 ## 一、协议链路
 
 ```

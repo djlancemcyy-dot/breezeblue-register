@@ -315,54 +315,70 @@ def register_one(email, password, invite, exits, exit_idx, max_exit_tries=3):
     return last or {"ok": False, "stage": "exhausted", "exit_idx": exit_idx}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--count", type=int, default=1, help="要成功多少个号")
-    ap.add_argument("--email", default="", help="只跑这个邮箱（跳过库存）")
-    ap.add_argument("--password", default="", help="指定密码（默认随机）")
-    ap.add_argument("--invite", default=INVITE)
-    ap.add_argument("--proxies", default="", help="逗号分隔的出口列表 http://host:port")
-    ap.add_argument("--proxy-file", default="", help="每行一个出口")
-    ap.add_argument("--max-box-tries", type=int, default=8, help="每个号最多换几个箱")
-    ap.add_argument("--max-exit-tries", type=int, default=3, help="每次最多换几个出口")
-    args = ap.parse_args()
 
+def run_batch(count=1, proxies="", proxy_file="", invite=None, fixed_email="", password="",
+              max_box_tries=8, max_exit_tries=3, log=print, should_stop=None, state=None):
+    """批量跑号；供 CLI 与 Web 面板共用。
+
+    log(msg)                进度日志
+    should_stop() -> bool   外部要求停止
+    state(dict)             运行状态（面板读它做进度条）
+    """
+    invite = INVITE if invite is None else invite
     os.makedirs(DATA, exist_ok=True)
-    exits = exits_from_args(args)
+    st = state if state is not None else {}
+    st.update({"target": count, "done": 0, "running": True, "current": "", "stage": "",
+               "started_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+    exits = []
+    if proxies:
+        exits += [p.strip() for p in proxies.split(",") if p.strip()]
+    if proxy_file:
+        exits += lines(proxy_file)
+    exits = list(dict.fromkeys(exits))
     if exits:
         alive = [p for p in exits if exit_alive(p)]
-        print("[exit] 可用出口 %d/%d: %s" % (len(alive), len(exits), ", ".join(alive)), flush=True)
+        log("[exit] 可用出口 %d/%d: %s" % (len(alive), len(exits), ", ".join(alive)))
         exits = alive or exits
 
     blocked = set(lines(DEAD))
     used = set(lines(USED))
-    pool = [args.email] if args.email else [e for e in inventory_boxes() if e not in used]
+    pool = [fixed_email] if fixed_email else [e for e in inventory_boxes() if e not in used]
     if not pool:
-        print("没有可用邮箱：检查 MAILNEST_KEY 或库存")
-        return
+        log("没有可用邮箱：检查 MAILNEST_KEY 或库存")
+        st["running"] = False
+        return st
 
     done, exit_idx = 0, 0
-    while done < args.count:
+    while done < count:
+        if should_stop and should_stop():
+            log("[stop] 收到停止指令")
+            break
         box = pick_box(pool, blocked)
         if not box:
-            print("库存里没有活箱了，停")
+            log("库存里没有活箱了，停")
             break
         pool = [e for e in pool if e != box]
-        pwd = args.password or ("Bz" + str(random.randint(100000, 999999)) + ".kQe" + str(random.randint(100, 999)))
-        print("\n[%d/%d] %s" % (done + 1, args.count, box), flush=True)
+        pwd = password or ("Bz" + str(random.randint(100000, 999999)) + ".kQe" + str(random.randint(100, 999)))
+        st["current"] = box
+        log("[%d/%d] %s" % (done + 1, count, box))
 
         ok = False
-        for bx in range(args.max_box_tries):
-            res = register_one(box, pwd, args.invite, exits, exit_idx, args.max_exit_tries)
+        for _ in range(max_box_tries):
+            if should_stop and should_stop():
+                break
+            res = register_one(box, pwd, invite, exits, exit_idx, max_exit_tries)
             exit_idx = res.get("exit_idx", exit_idx)
-            print("   -> ok=%s stage=%s mode=%s exit=%s" % (res.get("ok"), res.get("stage"),
-                                                            res.get("mode"), res.get("exit")), flush=True)
+            st["stage"] = str(res.get("stage"))
+            log("   -> ok=%s stage=%s mode=%s exit=%s" % (res.get("ok"), res.get("stage"),
+                                                          res.get("mode"), res.get("exit")))
             if res.get("ok"):
                 res.update(email=box, password=pwd, at=time.strftime("%Y-%m-%d %H:%M:%S"))
                 append(ACCS, json.dumps(res, ensure_ascii=False))
                 append(USED, box)
-                print("   ✅ %s  public_id=%s  own_code=%s" % (box, res.get("public_id"), res.get("own_code")), flush=True)
                 done += 1
+                st["done"] = done
+                log("   OK %s  public_id=%s  own_code=%s" % (box, res.get("public_id"), res.get("own_code")))
                 ok = True
                 break
             append(FAILS, json.dumps(dict(res, email=box), ensure_ascii=False))
@@ -373,17 +389,37 @@ def main():
                     break
                 pool = [e for e in pool if e != nxt]
                 box = nxt
-                print("   [box] 换箱 -> %s" % box, flush=True)
+                st["current"] = box
+                log("   [box] 换箱 -> %s" % box)
             elif res.get("stage") == "captcha_failed":
                 continue
             else:
                 time.sleep(random.uniform(3, 6))
         if not ok and not pool:
-            print("没有更多箱可试，停")
+            log("没有更多箱可试，停")
             break
         time.sleep(random.uniform(2, 5))
 
-    print("\n完成 %d/%d" % (done, args.count))
+    st["running"] = False
+    st["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    log("完成 %d/%d" % (done, count))
+    return st
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--count", type=int, default=1, help="要成功多少个号")
+    ap.add_argument("--email", default="", help="只跑这个邮箱（跳过库存）")
+    ap.add_argument("--password", default="", help="指定密码（默认随机）")
+    ap.add_argument("--invite", default=INVITE)
+    ap.add_argument("--proxies", default="", help="逗号分隔的出口列表 http://host:port")
+    ap.add_argument("--proxy-file", default="", help="每行一个出口")
+    ap.add_argument("--max-box-tries", type=int, default=8)
+    ap.add_argument("--max-exit-tries", type=int, default=3)
+    args = ap.parse_args()
+    run_batch(count=args.count, proxies=args.proxies, proxy_file=args.proxy_file,
+              invite=args.invite, fixed_email=args.email, password=args.password,
+              max_box_tries=args.max_box_tries, max_exit_tries=args.max_exit_tries)
 
 
 if __name__ == "__main__":
