@@ -56,6 +56,28 @@ python proto_register.py --count 5 \
 | `data/dead_boxes.txt` | 死箱黑名单 |
 | `data/failed.jsonl` | 每次失败的结构化原因（stage / mode / exit）|
 
+## 出口体检器（注册前必跑）
+
+Turnstile 过不过，**80% 取决于出口**。同一家住宅供应商里也混着机房段（Datacamp / M247 / OVH / CDN77），抽到就必挂。
+
+```bash
+python tools/exit_check.py --proxy http://127.0.0.1:7891
+python tools/exit_check.py --proxy-file exits.txt --json
+python tools/exit_check.py --proxy direct          # 直连自查
+```
+
+输出：
+
+| 判定 | 含义 | 动作 |
+|---|---|---|
+| `PASS` | 住宅/移动 ISP，未标代理 | 直接用 |
+| `RISKY` | 机房 IP，或 ASN 认不出是 ISP | 建议重新取号 |
+| `REJECT` | 出口不通，或被标 proxy/vpn/tor/datacenter | 必须换号 |
+
+判定不是只看「是不是住宅」，而是 **ASN 是否 ISP + 是否被标代理/机房 + 是否连得通** 三项合起来。
+
+> 配套提示词：`docs/prompt-给同事的AI.md` —— 直接把整段粘给对方的 AI，按步骤执行即可。
+
 ## Web 面板
 
 ```bash
