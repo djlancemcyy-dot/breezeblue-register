@@ -14,6 +14,7 @@
 pip install cloakbrowser>=0.6.4 curl_cffi>=0.17.0 requests
 # 首次运行会自动下载自带 Chromium 到 C:\Users\<user>\.cloakbrowser\
 # 免费版只允许 1 个并发会话 —— 必须串行跑，一次一个号
+# ★ 不需要注册、不需要 key；启动时那行 "Get your key ..." 是广告，忽略即可（只有要多并发才领 key）
 ~~~
 
 ## 2. 邮箱（MailNest 独占箱）

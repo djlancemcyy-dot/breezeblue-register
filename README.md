@@ -56,6 +56,17 @@ python proto_register.py --count 5 \
 | `data/dead_boxes.txt` | 死箱黑名单 |
 | `data/failed.jsonl` | 每次失败的结构化原因（stage / mode / exit）|
 
+## 指纹浏览器（CloakBrowser）
+
+**免费版不需要注册、不需要 key**，`pip install cloakbrowser` 装完直接用；启动时那行 “Get your key …” 是广告。
+免费 tier 只允许 **1 个并发会话** —— 串行跑号完全够用；要并行才需要去 cloakbrowser.dev 领 key。
+
+两个比 key 更要命的点：
+- `timezone` / `locale` 必须与出口国家一致（日本出口 → `Asia/Tokyo` + `ja-JP`）
+- 一个号一个独立 profile 目录，复用 profile 会让所有号共用同一台“设备”
+
+详见 [docs/cloakbrowser-说明.md](docs/cloakbrowser-说明.md)。
+
 ## 出口体检器（注册前必跑）
 
 Turnstile 过不过，**80% 取决于出口**。同一家住宅供应商里也混着机房段（Datacamp / M247 / OVH / CDN77），抽到就必挂。
